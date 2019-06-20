@@ -9,7 +9,7 @@ use strict;
 use warnings;
 use utf8;
 use charnames ':full';
-use Encode qw(encode_utf8);
+use Encode qw(encode_utf8 encode);
 use Data::Dumper;
 use Test::More;
 use lib 't','.';
@@ -189,6 +189,222 @@ for my $name ('LATIN CAPITAL LETTER N',
         is (length $result, 1, "Got 1 character for $desc");
         is (ord $result, $ord, "Got correct character for $desc");
     }
+}
+
+# Test inserting and selecting data
+
+sub ords { '(' . (join ', ', map ord, split //, $_[0]) . ')' }
+
+$dbh->{pg_enable_utf8} = 1;
+$dbh->do('DROP TABLE IF EXISTS t');
+for my $val (
+	"\xC3\xA1",
+	"\N{U+C3}\N{U+A1}",
+	"á",
+	"č",
+	"\x{263A}",
+	"\N{U+263A}",
+	"☺",
+	"\N{U+11111}"
+) {
+	{
+		my $ins = $val;
+		$dbh->do("CREATE TABLE t(s VARCHAR(10))");
+		my $sth = $dbh->prepare("INSERT INTO t(s) VALUES('$ins')");
+
+		$sth->execute();
+		my $fetch = $dbh->selectrow_array("SELECT s FROM t");
+		is (ords($fetch), ords($ins), 'p+e without bind');
+		$dbh->do("DROP TABLE t");
+	}
+	{
+		my $ins = $val;
+		$dbh->do("CREATE TABLE t(s VARCHAR(10))");
+		my $sth = $dbh->prepare("INSERT INTO t(s) VALUES(?)");
+
+		$sth->execute($ins);
+		my $fetch = $dbh->selectrow_array("SELECT s FROM t");
+		is (ords($fetch), ords($ins), 'p+e with bind');
+		$dbh->do("DROP TABLE t");
+	}
+	{
+		my $ins = $val;
+		$dbh->do("CREATE TABLE t(s VARCHAR(10))");
+		$dbh->do("INSERT INTO t(s) VALUES('$ins')");
+
+		my ($fetch) = $dbh->selectrow_array("SELECT s FROM t");
+		is (ords($fetch), ords($ins), 'do without bind');
+		$dbh->do("DROP TABLE t");
+	}
+	{
+		my $ins = $val;
+		$dbh->do("CREATE TABLE t(s VARCHAR(10))");
+		$dbh->do("INSERT INTO t(s) VALUES(?)", undef, $ins);
+
+		my ($fetch) = $dbh->selectrow_array("SELECT s FROM t");
+		is (ords($fetch), ords($ins), 'do with bind');
+		$dbh->do("DROP TABLE t");
+	}
+
+	# Binary
+	my $hex_sql = "encode(b, 'hex')";
+	my $binary_sql = 'BYTEA';
+	my $binary_type = { pg_type => DBD::Pg::PG_BYTEA() };
+	my $bins = encode('UTF-8', $val);
+	for my $upgraded (0, 1) {
+		$upgraded ? utf8::upgrade($bins) : utf8::downgrade($bins);
+		{
+			$dbh->do("CREATE TABLE t(b $binary_sql)");
+			my $sth = $dbh->prepare("INSERT INTO t(b) VALUES(" . $dbh->quote($bins, $binary_type) . ")");
+
+			ok ($sth, 'BIN prepare without bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			$sth->execute();
+			my ($fetch) = $dbh->selectrow_array("SELECT b FROM t");
+			is (ords($fetch), ords($bins), 'BIN p+e without bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			my $hfetch = pack("H*", $dbh->selectrow_array("SELECT $hex_sql FROM t"));
+			is (ords($hfetch), ords($bins), 'BIN p+e without bind hex '. ($upgraded ? 'upgraded' : 'downgraded'));
+			$dbh->do("DROP TABLE t");
+		}
+		{
+			$dbh->do("CREATE TABLE t(b $binary_sql)");
+			my $sth = $dbh->prepare("INSERT INTO t(b) VALUES(?)");
+			ok ($sth, 'BIN prepare with bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			$sth->bind_param(1, $bins, $binary_type);
+
+			$sth->execute;
+			my ($fetch) = $dbh->selectrow_array("SELECT b FROM t");
+			is (ords($fetch), ords($bins), 'BIN p+e with bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			my $hfetch = pack("H*", $dbh->selectrow_array("SELECT $hex_sql FROM t"));
+			is (ords($hfetch), ords($bins), 'BIN p+e with bind hex '. ($upgraded ? 'upgraded' : 'downgraded'));
+			$dbh->do("DROP TABLE t");
+		}
+		{
+			$dbh->do("CREATE TABLE t(b $binary_sql)");
+			$dbh->do("INSERT INTO t(b) VALUES(" . $dbh->quote($bins, $binary_type) . ")");
+
+			my ($fetch) = $dbh->selectrow_array("SELECT b FROM t");
+			is (ords($fetch), ords($bins), 'BIN do without bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			my $hfetch = pack("H*", $dbh->selectrow_array("SELECT $hex_sql FROM t"));
+			is (ords($hfetch), ords($bins), 'BIN do without bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			$dbh->do("DROP TABLE t");
+		}
+	}
+
+	# Combined binary + Unicode
+	for my $upgraded (0, 1) {
+		$upgraded ? utf8::upgrade($bins) : utf8::downgrade($bins);
+		{
+			my $ins = $val;
+			$dbh->do("CREATE TABLE t(s VARCHAR(10), b $binary_sql)");
+			my $sth = $dbh->prepare("INSERT INTO t(s, b) VALUES(" . qq('$ins') . ", " . $dbh->quote($bins, $binary_type) . ")");
+			ok ($sth, 'COMB prepare without bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+
+			$sth->execute();
+			my ($fetch, $bfetch) = $dbh->selectrow_array("SELECT s, b FROM t");
+			is (ords($fetch), ords($ins), 'COMB p+e without bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			is (ords($bfetch), ords($bins), 'COMB BIN p+e without bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			my $hfetch = pack("H*", $dbh->selectrow_array("SELECT $hex_sql FROM t"));
+			is (ords($hfetch), ords($bins), 'COMB BIN p+e without bind hex '. ($upgraded ? 'upgraded' : 'downgraded'));
+			$dbh->do("DROP TABLE t");
+		}
+		{
+			my $ins = $val;
+			$dbh->do("CREATE TABLE t(s VARCHAR(10), b $binary_sql)");
+			my $sth = $dbh->prepare("INSERT INTO t(s, b) VALUES(?, ?)");
+			ok ($sth, 'COMB prepare with bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			$sth->bind_param(1, $ins);
+			$sth->bind_param(2, $bins, $binary_type);
+
+			$sth->execute();
+			my ($fetch, $bfetch) = $dbh->selectrow_array("SELECT s, b FROM t");
+			is (ords($fetch), ords($ins), 'COMB p+e with bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			is (ords($bfetch), ords($bins), 'COMB BIN p+e with bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			my $hfetch = pack("H*", $dbh->selectrow_array("SELECT $hex_sql FROM t"));
+			is (ords($hfetch), ords($bins), 'COMB BIN p+e with bind hex '. ($upgraded ? 'upgraded' : 'downgraded'));
+			$dbh->do("DROP TABLE t");
+		}
+		{
+			my $ins = $val;
+			$dbh->do("CREATE TABLE t(s VARCHAR(10), b $binary_sql)");
+			$dbh->do("INSERT INTO t(s, b) VALUES(" . qq('$ins') . ", " . $dbh->quote($bins, $binary_type) . ")");
+
+			my ($fetch, $bfetch) = $dbh->selectrow_array("SELECT s, b FROM t");
+			is (ords($fetch), ords($ins), 'COMB do without bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			is (ords($bfetch), ords($bins), 'COMB BIN do without bind '. ($upgraded ? 'upgraded' : 'downgraded'));
+			my $hfetch = pack("H*", $dbh->selectrow_array("SELECT $hex_sql FROM t"));
+			is (ords($hfetch), ords($bins), 'COMB BIN do without bind hex '. ($upgraded ? 'upgraded' : 'downgraded'));
+			$dbh->do("DROP TABLE t");
+		}
+	}
+
+	{
+		my $ins = $val;
+		$dbh->do("CREATE TABLE t(s VARCHAR(10))");
+		$dbh->do("INSERT INTO t(s) VALUES(?)", undef, $ins);
+		$dbh->do("COPY t TO STDOUT");
+		my @data; my $i = 0;
+		1 while $dbh->pg_getcopydata(\$data[$i++]) >= 0;
+
+		my ($fetch) = ($data[0] =~ /^(.*)\n$/);
+		is (ords($fetch), ords($ins), 'COPY TO STDOUT');
+		$dbh->do("DROP TABLE t");
+	}
+
+	{
+		my $ins = $val;
+		$dbh->do("CREATE TABLE t(s VARCHAR(10))");
+		$dbh->do("COPY t FROM STDIN");
+		$dbh->pg_putcopydata($ins);
+		$dbh->pg_putcopyend();
+
+		my $fetch = $dbh->selectrow_array("SELECT s FROM t");
+		is (ords($fetch), ords($ins), 'COPY FROM STDIN');
+		$dbh->do("DROP TABLE t");
+	}
+
+	{
+		my $ins = $val;
+		$dbh->do("CREATE TABLE t(s VARCHAR(10))");
+		$dbh->do("COPY t FROM STDIN");
+		$dbh->pg_putcopydata($ins);
+		$dbh->pg_putcopyend();
+		$dbh->do("COPY t TO STDOUT");
+		my @data; my $i = 0;
+		1 while $dbh->pg_getcopydata(\$data[$i++]) >= 0;
+
+		my ($fetch) = ($data[0] =~ /^(.*)\n$/);
+		is (ords($fetch), ords($ins), 'COPY FROM STDIN + COPY TO STDOUT');
+		$dbh->do("DROP TABLE t");
+	}
+
+	for my $upgraded (0, 1) {
+		$upgraded ? utf8::upgrade($bins) : utf8::downgrade($bins);
+		{
+			$dbh->do("CREATE TABLE t(b $binary_sql)");
+			my $sth = $dbh->prepare("INSERT INTO t(b) VALUES(?)");
+			$sth->bind_param(1, $bins, $binary_type);
+			$sth->execute;
+			$dbh->do("COPY t TO STDOUT (FORMAT BINARY)");
+			my @data; my $i = 0;
+			1 while $dbh->pg_getcopydata(\$data[$i++]) >= 0;
+
+			my ($fetch) = ($data[0] =~ /^PGCOPY\n\xff\r\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01....(.*)$/s);
+			is (ords($fetch), ords($bins), 'COPY TO STDOUT BINARY ' . ($upgraded ? 'upgraded' : 'downgraded'));
+			$dbh->do("DROP TABLE t");
+		}
+
+		{
+			$dbh->do("CREATE TABLE t(b $binary_sql)");
+			$dbh->do("COPY t FROM STDIN (FORMAT BINARY)");
+			$dbh->pg_putcopydata("PGCOPY\n\xff\r\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01" . pack('N', length($bins)) . $bins);
+			$dbh->pg_putcopydata("\xff\xff");
+			$dbh->pg_putcopyend();
+
+			my $fetch = $dbh->selectrow_array("SELECT b FROM t");
+			is (ords($fetch), ords($bins), 'COPY FROM STDIN BINARY ' . ($upgraded ? 'upgraded' : 'downgraded'));
+			$dbh->do("DROP TABLE t");
+		}
+	}
 }
 
 cleanup_database($dbh,'test');
